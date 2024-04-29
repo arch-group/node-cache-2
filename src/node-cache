@@ -1,0 +1,560 @@
+import { EventEmitter } from "node:events";
+
+/**
+ * Since 4.1.0: Key-validation: The keys can be given as either string or number,
+ * but are casted to a string internally anyway.
+ */
+type Key = string | number;
+
+type ValueSetItem<T = any> = {
+	key: Key;
+	val: T;
+	ttl?: number;
+};
+
+type Callback<T> = (err: any, data: T | undefined) => void;
+
+interface WrappedValue<T> {
+	/** ttl */
+	t: number;
+	/** value */
+	v: T;
+}
+
+interface Data {
+	[key: string]: WrappedValue<any>;
+}
+
+export interface Stats {
+	hits: number;
+	misses: number;
+	keys: number;
+	ksize: number;
+	vsize: number;
+}
+
+export interface Options {
+	/**
+	 * If enabled, all values will be stringified during the set operation
+	 *
+	 * @type {boolean}
+	 * @memberof Options
+	 */
+	forceString?: boolean;
+
+	objectValueSize?: number;
+	promiseValueSize?: number;
+	arrayValueSize?: number;
+
+	/**
+	 * standard time to live in seconds. 0 = infinity
+	 *
+	 * @type {number}
+	 * @memberof Options
+	 */
+	stdTTL?: number;
+
+	/**
+	 * time in seconds to check all data and delete expired keys
+	 *
+	 * @type {number}
+	 * @memberof Options
+	 */
+	checkperiod?: number;
+
+	/**
+	 * en/disable cloning of variables.
+	 * disabling this is strongly encouraged when aiming for performance!
+	 *
+	 * If `true`: set operations store a clone of the value and get operations will create a fresh clone of the cached value
+	 * If `false` you'll just store a reference to your value
+	 *
+	 * @type {boolean}
+	 * @memberof Options
+	 */
+	useClones?: boolean;
+
+	errorOnMissing?: boolean;
+	deleteOnExpire?: boolean;
+
+	/**
+	 * max amount of keys that are being stored.
+	 * set operations will throw an error when the cache is full
+	 *
+	 * @type {number}
+	 * @memberof Options
+	 */
+	maxKeys?: number;
+}
+
+export class NodeCache extends EventEmitter {
+	private _ERRORS = {
+		ENOTFOUND: "Key `__key` not found",
+		ECACHEFULL: "Cache max keys amount exceeded",
+		EKEYTYPE:
+			"The key argument has to be of type `string` or `number`. Found: `__key`",
+		EKEYSTYPE: "The keys argument has to be an array.",
+		ETTLTYPE: "The ttl argument has to be a number.",
+	};
+	ERRORS: { [key: string]: (data: any) => string } = {};
+
+	checkTimeout: any;
+
+	validKeyTypes: string[] = [];
+
+	/** container for cached data */
+	data: Data;
+
+	/** module options */
+	options: Required<Options>;
+
+	/** statistics container */
+	stats: Stats;
+
+	constructor(options: Options = {}) {
+		super();
+
+		this._initErrors();
+
+		this.data = {};
+
+		this.options = {
+			forceString: false,
+			objectValueSize: 80,
+			promiseValueSize: 80,
+			arrayValueSize: 40,
+			stdTTL: 0,
+			checkperiod: 600,
+			useClones: true,
+			deleteOnExpire: true,
+			maxKeys: -1,
+			errorOnMissing: false,
+			...options,
+		};
+
+		this.stats = {
+			hits: 0,
+			misses: 0,
+			keys: 0,
+			ksize: 0,
+			vsize: 0,
+		};
+
+		this.validKeyTypes = ["string", "number"];
+
+		this._checkData();
+	}
+
+	/**
+	 * get a cached key and change the stats
+	 *
+	 * @param key cache key
+	 * @returns The value stored in the key
+	 */
+	get<T>(key: Key): T | undefined {
+		const err = this._isInvalidKey(key);
+		if (err) {
+			throw err;
+		}
+		if (this.data[key] && this._check(key, this.data[key])) {
+			this.stats.hits++;
+			const _ret = this._unwrap(this.data[key]);
+			return _ret;
+		} else {
+			this.stats.misses++;
+			return undefined;
+		}
+	}
+
+	/**
+	 * get multiple cached keys at once and change the stats
+	 *
+	 * @param keys an array of keys
+	 * @returns an object containing the values stored in the matching keys
+	 */
+	mget<T>(keys: Key[]): { [key: string]: T } {
+		if (!Array.isArray(keys)) {
+			const _err = this._error("EKEYSTYPE");
+			throw _err;
+		}
+		const oRet: { [key: string]: T } = {};
+		for (let key of keys) {
+			const err = this._isInvalidKey(key);
+			if (err) {
+				throw err;
+			}
+			if (this.data[key] && this._check(key, this.data[key])) {
+				this.stats.hits++;
+				oRet[key] = this._unwrap(this.data[key]);
+			} else {
+				this.stats.misses++;
+			}
+		}
+		return oRet;
+	}
+
+	/**
+	 * set a cached key and change the stats
+	 *
+	 * @param key cache key
+	 * @param value A element to cache. If the option `option.forceString` is `true` the module trys to translate
+	 * it to a serialized JSON
+	 * @param ttl The time to live in seconds.
+	 */
+	set<T>(key: Key, value: T, ttl?: number): boolean {
+		let valueToStore: any = value;
+		if (
+			this.options.maxKeys > -1 &&
+			this.stats.keys >= this.options.maxKeys
+		) {
+			const _err = this._error("ECACHEFULL");
+			throw _err;
+		}
+		if (this.options.forceString && typeof valueToStore !== "string") {
+			valueToStore = JSON.stringify(valueToStore);
+		}
+		if (!ttl) {
+			ttl = this.options.stdTTL;
+		}
+		const err = this._isInvalidKey(key);
+		if (err) {
+			throw err;
+		}
+		let existent = false;
+		if (this.data[key]) {
+			existent = true;
+			this.stats.vsize -= this._getValLength(
+				this._unwrap(this.data[key], false)
+			);
+		}
+		this.data[key] = this._wrap(valueToStore, ttl);
+		this.stats.vsize += this._getValLength(valueToStore);
+		if (!existent) {
+			this.stats.ksize += this._getKeyLength(key);
+			this.stats.keys++;
+		}
+		this.emit("set", key, valueToStore);
+		return true;
+	}
+
+	/**
+	 * in the event of a cache miss (no value is assinged to given cache key), value will be written to cache and returned.
+	 * In case of cache hit, cached value will be returned without executing given value. If the given value is type of `Function`,
+	 * it will be executed and returned result will be fetched
+	 *
+	 * @param key cache key
+	 * @param ttl The time to live in seconds.
+	 * @param value function that returns a value to be stored in cache, or the value itself
+	 */
+	fetch<T>(key: Key, ttl: any, value: any): T {
+		if (this.has(key)) {
+			return this.get<T>(key) as T;
+		}
+		if (typeof value === "undefined") {
+			value = ttl;
+			ttl = undefined;
+		}
+		const _ret = typeof value === "function" ? value() : value;
+		this.set(key, _ret, ttl);
+		return _ret;
+	}
+
+	/**
+	 * set multiple cached keys at once and change the stats
+	 *
+	 * @param keyValueSet an array of object which includes key,value and ttl
+	 */
+	mset<T>(keyValueSet: ValueSetItem<T>[]): boolean {
+		if (
+			this.options.maxKeys > -1 &&
+			this.stats.keys + keyValueSet.length >= this.options.maxKeys
+		) {
+			const _err = this._error("ECACHEFULL");
+			throw _err;
+		}
+		for (let keyValuePair of keyValueSet) {
+			const { key, val, ttl } = keyValuePair;
+			if (ttl && typeof ttl !== "number") {
+				const _err = this._error("ETTLTYPE");
+				throw _err;
+			}
+			const err = this._isInvalidKey(key);
+			if (err) {
+				throw err;
+			}
+		}
+		for (let keyValuePair of keyValueSet) {
+			const { key, val, ttl } = keyValuePair;
+			this.set(key, val, ttl);
+		}
+		return true;
+	}
+
+	/**
+	 * remove keys
+	 * @param keys cache key to delete or a array of cache keys
+	 * @param cb Callback function
+	 * @returns Number of deleted keys
+	 */
+	del(keys: Key | Key[]): number {
+		if (!Array.isArray(keys)) {
+			keys = [keys];
+		}
+		let delCount = 0;
+		for (let key of keys) {
+			const err = this._isInvalidKey(key);
+			if (err) {
+				throw err;
+			}
+			if (this.data[key]) {
+				this.stats.vsize -= this._getValLength(
+					this._unwrap(this.data[key], false)
+				);
+				this.stats.ksize -= this._getKeyLength(key);
+				this.stats.keys--;
+				delCount++;
+				const oldVal = this.data[key];
+				delete this.data[key];
+				this.emit("del", key, oldVal.v);
+			}
+		}
+		return delCount;
+	}
+
+	/**
+	 * get a cached key and remove it from the cache.
+	 * Equivalent to calling `get(key)` + `del(key)`.
+	 * Useful for implementing `single use` mechanism such as OTP, where once a value is read it will become obsolete.
+	 *
+	 * @param key cache key
+	 * @returns The value stored in the key
+	 */
+	take<T>(key: Key): T | undefined {
+		const _ret = this.get<T>(key);
+		if (_ret) {
+			this.del(key);
+		}
+		return _ret;
+	}
+
+	/**
+	 * reset or redefine the ttl of a key. If `ttl` is not passed or set to 0 it's similar to `.del()`
+	 */
+	ttl(key: Key, ttl?: number) {
+		ttl = ttl || this.options.stdTTL;
+		if (!key) {
+			return false;
+		}
+		const err = this._isInvalidKey(key);
+		if (err) {
+			throw err;
+		}
+		if (this.data[key] && this._check(key, this.data[key])) {
+			if (ttl >= 0) {
+				this.data[key] = this._wrap(this.data[key].v, ttl, false);
+			} else {
+				this.del(key);
+			}
+			return true;
+		} else {
+			return false;
+		}
+	}
+
+	getTtl(key: Key) {
+		if (!key) {
+			return undefined;
+		}
+		const err = this._isInvalidKey(key);
+		if (err) {
+			throw err;
+		}
+		if (this.data[key] && this._check(key, this.data[key])) {
+			return this.data[key].t;
+		} else {
+			return undefined;
+		}
+	}
+
+	/**
+	 * list all keys within this cache
+	 * @returns An array of all keys
+	 */
+	keys(): string[] {
+		return Object.keys(this.data);
+	}
+
+	/**
+	 * Check if a key is cached
+	 * @param key cache key to check
+	 * @returns Boolean indicating if the key is cached or not
+	 */
+	has(key: Key): boolean {
+		return !!(this.data[key] && this._check(key, this.data[key]));
+	}
+
+	/**
+	 * get the stats
+	 *
+	 * @returns Stats data
+	 */
+	getStats(): Stats {
+		return this.stats;
+	}
+
+	/**
+	 * flush the whole data and reset the stats
+	 */
+	flushAll(_startPeriod = true): void {
+		this.data = {};
+		this.stats = {
+			hits: 0,
+			misses: 0,
+			keys: 0,
+			ksize: 0,
+			vsize: 0,
+		};
+		this._killCheckPeriod();
+		this._checkData(_startPeriod);
+		this.emit("flush");
+	}
+
+	/**
+	 * flush the stats and reset all counters to 0
+	 */
+	flushStats(): void {
+		this.stats = {
+			hits: 0,
+			misses: 0,
+			keys: 0,
+			ksize: 0,
+			vsize: 0,
+		};
+		this.emit("flush_stats");
+	}
+
+	/**
+	 * This will clear the interval timeout which is set on checkperiod option.
+	 */
+	close(): void {
+		this._killCheckPeriod();
+	}
+
+	_checkData(startPeriod = true) {
+		for (let [key, value] of Object.entries(this.data)) {
+			this._check(key, value);
+		}
+		if (startPeriod && this.options.checkperiod > 0) {
+			this.checkTimeout = setTimeout(
+				() => this._checkData(),
+				this.options.checkperiod * 1000,
+				startPeriod
+			);
+			if (this.checkTimeout && this.checkTimeout.unref)
+				this.checkTimeout.unref();
+		}
+	}
+
+	_killCheckPeriod() {
+		if (this.checkTimeout) clearTimeout(this.checkTimeout);
+	}
+
+	_check<T>(key: Key, data: WrappedValue<T>): boolean {
+		let _retval = true;
+		if (data.t !== 0 && data.t < Date.now()) {
+			if (this.options.deleteOnExpire) {
+				_retval = false;
+				this.del(key);
+			}
+			this.emit("expired", key, this._unwrap(data));
+		}
+		return _retval;
+	}
+
+	_isInvalidKey(key: Key) {
+		if (!this.validKeyTypes.includes(typeof key)) {
+			return this._error("EKEYTYPE", { type: typeof key });
+		}
+	}
+
+	_wrap<T>(value: WrappedValue<T>, ttl: number, asClone = true) {
+		if (!this.options.useClones) {
+			asClone = false;
+		}
+		const now = Date.now();
+		let livetime = 0;
+		const ttlMultiplicator = 1000;
+		if (ttl === 0) {
+			livetime = 0;
+		} else if (ttl) {
+			livetime = now + ttl * ttlMultiplicator;
+		} else {
+			if (this.options.stdTTL === 0) {
+				livetime = this.options.stdTTL;
+			} else {
+				livetime = now + this.options.stdTTL * ttlMultiplicator;
+			}
+		}
+		return {
+			t: livetime,
+			v: asClone ? structuredClone(value) : value,
+		};
+	}
+
+	_unwrap<T>(value: WrappedValue<T>, asClone = true): T | null {
+		if (!this.options.useClones) {
+			asClone = false;
+		}
+		if (value.v) {
+			return asClone ? structuredClone(value.v) : value.v;
+		}
+		return null;
+	}
+
+	_getKeyLength(key: Key) {
+		return key.toString().length;
+	}
+
+	_getValLength<T>(value: T) {
+		if (typeof value === "string") {
+			return value.length;
+		} else if (this.options.forceString) {
+			return JSON.stringify(value).length;
+		} else if (Array.isArray(value)) {
+			return this.options.arrayValueSize * value.length;
+		} else if (typeof value === "number") {
+			return 8;
+			// @ts-expect-error
+		} else if (value && typeof value.then === "function") {
+			return this.options.promiseValueSize;
+		} else if (Buffer && Buffer.isBuffer(value)) {
+			return value.length;
+		} else if (value && typeof value === "object") {
+			return this.options.objectValueSize * Object.keys(value).length;
+		} else if (typeof value === "boolean") {
+			return 8;
+		} else {
+			return 0;
+		}
+	}
+
+	_error(type: string, data = {}) {
+		const error: any = new Error();
+		error.name = type;
+		error.errorcode = type;
+		error.message = this.ERRORS[type] ? this.ERRORS[type](data) : "-";
+		error.data = data;
+		return error;
+	}
+
+	_initErrors() {
+		this.ERRORS = {};
+		for (let [_errT, _errMsg] of Object.entries(this._ERRORS)) {
+			this.ERRORS[_errT] = this.createErrorMessage(_errMsg);
+		}
+	}
+
+	createErrorMessage(errMsg: string): (args: any) => string {
+		return (args) => errMsg.replace("__key", args.type);
+	}
+}
